@@ -36,41 +36,48 @@ def build_session() -> requests.Session:
     )
     adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
     s.mount("https://", adapter)
-    s.headers.update({"User-Agent": "MTDCNC product-catalog-ingestor/1.0"})
+    s.headers.update({
+        "User-Agent": "MTDCNC product-catalog-ingestor/1.0",
+        "Accept": "application/json,text/plain,*/*",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://engtechgroup.com/machines/"
+    })
     return s
 
 @app.route("/etg/products", methods=["GET"])
 def etg_products():
-    max_seconds = int(request.args.get("max_seconds", "55"))
-    per_request_timeout = float(request.args.get("timeout", "18"))
-    passes = int(request.args.get("passes", "2"))  # try 2 passes to recover unstable paging
+    # raise defaults so you can prove full 310 first
+    max_seconds = int(request.args.get("max_seconds", "120"))
+    per_request_timeout = float(request.args.get("timeout", "25"))
 
     t0 = time.time()
     today = datetime.utcnow().strftime("%Y-%m-%d")
     session = build_session()
 
-    # --- Fetch page 1 to get count/per_page ---
-    errors = []
+    # fetch page 1
+    r1 = session.get(ETG_ENDPOINT, params={"page": 1, "feature[type]": "all"}, timeout=per_request_timeout)
     try:
-        r1 = session.get(ETG_ENDPOINT, params={"page": 1, "feature[type]": "all"}, timeout=per_request_timeout)
         data1 = r1.json()
     except Exception as e:
-        return jsonify({"error": "Failed to fetch/parse ETG page 1", "details": str(e)}), 502
+        return jsonify({"error": "page1_not_json", "status": r1.status_code, "body_preview": r1.text[:200], "details": str(e)}), 502
 
-    etg_reported_count = int((data1.get("details") or {}).get("count") or 0)
-    per_page = int((data1.get("details") or {}).get("products_per_page") or 15)
+    details1 = data1.get("details") or {}
+    etg_reported_count = int(details1.get("count") or 0)
+    per_page = int(details1.get("products_per_page") or 15)
     expected_pages = max(1, (etg_reported_count + per_page - 1) // per_page)
 
-    seen_urls = set()
+    seen = set()
     products = []
+    page_stats = []
 
-    def ingest_products(page_data):
+    def ingest(page_data):
         added = 0
         for p in (page_data.get("products") or []):
             url = p.get("url")
-            if not url or url in seen_urls:
+            if not url or url in seen:
                 continue
-            seen_urls.add(url)
+            seen.add(url)
+
             brand = (p.get("manufacturer") or "").strip() or "Unknown"
             products.append({
                 "source": "etg",
@@ -87,42 +94,61 @@ def etg_products():
             added += 1
         return added
 
-    # ingest page 1
-    ingest_products(data1)
+    # page 1 stats
+    resp_page_1 = int((data1.get("details") or {}).get("page") or 1)
+    returned_1 = len(data1.get("products") or [])
+    added_1 = ingest(data1)
+    page_stats.append({
+        "requested_page": 1,
+        "response_page": resp_page_1,
+        "status": r1.status_code,
+        "returned_count": returned_1,
+        "unique_added": added_1
+    })
 
-    # --- Passes over all pages to reduce “missing uniques” due to unstable ordering ---
-    pages_fetched = 1
-    for pass_no in range(1, passes + 1):
-        for page in range(2, expected_pages + 1):
-            if time.time() - t0 > max_seconds:
-                errors.append({"page": page, "error": "max_seconds exceeded"})
-                break
+    truncated = False
 
-            try:
-                r = session.get(
-                    ETG_ENDPOINT,
-                    params={"page": page, "feature[type]": "all"},
-                    timeout=per_request_timeout
-                )
-                page_data = r.json()
-                pages_fetched += 1
-                ingest_products(page_data)
-            except Exception as e:
-                errors.append({"page": page, "error": str(e)})
-                continue
-
-        # if we reached ETG’s reported unique count, stop
-        if etg_reported_count and len(seen_urls) >= etg_reported_count:
+    for page in range(2, expected_pages + 1):
+        if (time.time() - t0) > max_seconds:
+            truncated = True
             break
+
+        r = session.get(ETG_ENDPOINT, params={"page": page, "feature[type]": "all"}, timeout=per_request_timeout)
+
+        try:
+            data = r.json()
+        except Exception:
+            page_stats.append({
+                "requested_page": page,
+                "response_page": None,
+                "status": r.status_code,
+                "returned_count": None,
+                "unique_added": 0,
+                "error": "not_json",
+                "body_preview": r.text[:120]
+            })
+            continue
+
+        resp_page = int((data.get("details") or {}).get("page") or 0)
+        returned = len(data.get("products") or [])
+        added = ingest(data)
+
+        page_stats.append({
+            "requested_page": page,
+            "response_page": resp_page,
+            "status": r.status_code,
+            "returned_count": returned,
+            "unique_added": added
+        })
 
     return jsonify({
         "total": len(products),
-        "unique_urls": len(seen_urls),
+        "unique_urls": len(seen),
         "etg_reported_count": etg_reported_count,
         "per_page": per_page,
         "expected_pages": expected_pages,
-        "pages_fetched": pages_fetched,
         "duration_seconds": round(time.time() - t0, 2),
-        "errors": errors[:20],  # cap output size
+        "truncated": truncated,
+        "page_stats": page_stats,
         "products": products
     })
